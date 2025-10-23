@@ -92,6 +92,15 @@ IGRAPH_EXPORT igraph_error_t igraph_edge_betweenness_subset(
         igraph_es_t eids,
         igraph_bool_t directed, igraph_bool_t normalized);
 
+IGRAPH_EXPORT igraph_error_t igraph_edge_betweenness_subset_limit(
+        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *distances,
+        igraph_vector_t *res,
+        igraph_vs_t sources, igraph_vs_t targets,
+        const igraph_vector_t *population_weights,
+        igraph_real_t lowerLimit, igraph_real_t upperLimit,
+        igraph_es_t eids,
+        igraph_bool_t directed, igraph_bool_t normalized);
+
 /**
  * \typedef igraph_pagerank_algo_t
  * \brief PageRank algorithm implementation.
