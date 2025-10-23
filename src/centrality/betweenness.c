@@ -1402,3 +1402,237 @@ igraph_error_t igraph_edge_betweenness_subset(
 
     return IGRAPH_SUCCESS;
 }
+
+/**
+ * \ingroup structural
+ * \function igraph_edge_betweenness_subset
+ * \brief Edge betweenness centrality for a subset of source and target vertices.
+ *
+ * This function computes the subset-limited version of edge betweenness centrality
+ * by considering only those shortest paths that lie between vertices in a given
+ * source and target subset.
+ *
+ * \param graph The graph object.
+ * \param weights An optional weight vector for weighted
+ *        betweenness. No edge weight may be NaN. Supply a null
+ *        pointer here for unweighted betweenness.
+ * \param res The result of the computation, vector containing the
+ *        betweenness scores for the edges.
+ * \param sources A vertex selector for the sources of the shortest paths taken
+ *        into considuration in the betweenness calculation.
+ * \param targets A vertex selector for the targets of the shortest paths taken
+ *        into considuration in the betweenness calculation.
+ * \param eids The edges for which the subset-limited betweenness centrality
+ *        scores will be returned. This parameter is for convenience only.
+ *        Internally, the betweenness will be calculated for all edges.
+ * \param directed If true directed paths will be considered
+ *        for directed graphs. It is ignored for undirected graphs.
+ * \param normalized Whether to normalize betweenness scores. Normalization is
+ *        currently unimplemented, and setting this to \c true raises an error.
+ * \return Error code:
+ *        \c IGRAPH_ENOMEM, not enough memory for temporary data.
+ *        \c IGRAPH_EINVVID, invalid vertex ID passed in \p sources or \p targets
+ *
+ * Time complexity: O(|S||E|), where
+ * |S| is the number of vertices in the subset and
+ * |E| is the number of edges in the graph.
+ *
+ * \sa \ref igraph_edge_betweenness() to compute the exact edge betweenness and
+ * \ref igraph_edge_betweenness_cutoff() to compute the range-limited edge betweenness.
+ */
+igraph_error_t igraph_edge_betweenness_subset_limit(
+        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *distances,
+        igraph_vector_t *res,
+        igraph_vs_t sources, igraph_vs_t targets, const igraph_vector_t *population_weights,
+        igraph_real_t lowerLimit, igraph_real_t upperLimit,
+        igraph_es_t eids,
+        igraph_bool_t directed, igraph_bool_t normalized) {
+
+    igraph_int_t no_of_nodes = igraph_vcount(graph);
+    igraph_int_t no_of_edges = igraph_ecount(graph);
+    igraph_int_t no_of_sources;
+    igraph_int_t no_of_targets;
+    igraph_int_t no_of_processed_sources;
+    igraph_inclist_t inclist, parents;
+    igraph_vit_t vit;
+    igraph_eit_t eit;
+    igraph_neimode_t mode = directed ? IGRAPH_OUT : IGRAPH_ALL;
+    igraph_vector_t dist;
+    igraph_vector_t v_tmpres, *tmpres = &v_tmpres;
+    igraph_real_t *nrgeo;
+    igraph_real_t *tmpscore;
+    igraph_int_t source, j;
+    bool *is_target;
+    igraph_stack_int_t S;
+    igraph_real_t normalization_factor;
+    igraph_vector_t tmp_population_weights;
+
+    IGRAPH_CHECK(betweenness_check_weights(weights, no_of_edges));
+
+    IGRAPH_CHECK(igraph_vs_size(graph, &sources, &no_of_sources));
+    IGRAPH_CHECK(igraph_vs_size(graph, &targets, &no_of_targets));
+
+    igraph_real_t population_sum = 0.0;
+    for (igraph_int_t i = 0; i < no_of_nodes; i++) {
+        population_sum += VECTOR(*population_weights)[i];
+    }
+    IGRAPH_VECTOR_INIT_FINALLY(&tmp_population_weights, no_of_nodes);
+
+    is_target = IGRAPH_CALLOC(no_of_nodes, bool);
+    IGRAPH_CHECK_OOM(is_target, "Insufficient memory for subset edge betweenness calculation.");
+    IGRAPH_FINALLY(igraph_free, is_target);
+
+    IGRAPH_CHECK(igraph_vit_create(graph, targets, &vit));
+    IGRAPH_FINALLY(igraph_vit_destroy, &vit);
+    for (IGRAPH_VIT_RESET(vit); !IGRAPH_VIT_END(vit); IGRAPH_VIT_NEXT(vit)) {
+        is_target[IGRAPH_VIT_GET(vit)] = true;
+    }
+    igraph_vit_destroy(&vit);
+    IGRAPH_FINALLY_CLEAN(1);
+
+    IGRAPH_CHECK(igraph_inclist_init(graph, &inclist, mode, IGRAPH_NO_LOOPS));
+    IGRAPH_FINALLY(igraph_inclist_destroy, &inclist);
+    IGRAPH_CHECK(igraph_inclist_init_empty(&parents, no_of_nodes));
+    IGRAPH_FINALLY(igraph_inclist_destroy, &parents);
+
+    IGRAPH_VECTOR_INIT_FINALLY(&dist, no_of_nodes);
+
+    nrgeo = IGRAPH_CALLOC(no_of_nodes, igraph_real_t);
+    IGRAPH_CHECK_OOM(nrgeo, "Insufficient memory for subset edge betweenness calculation.");
+    IGRAPH_FINALLY(igraph_free, nrgeo);
+
+    tmpscore = IGRAPH_CALLOC(no_of_nodes, igraph_real_t);
+    IGRAPH_CHECK_OOM(tmpscore, "Insufficient memory for subset edge betweenness calculation.");
+    IGRAPH_FINALLY(igraph_free, tmpscore);
+
+    IGRAPH_CHECK(igraph_stack_int_init(&S, no_of_nodes));
+    IGRAPH_FINALLY(igraph_stack_int_destroy, &S);
+
+    if (!igraph_es_is_all(&eids)) {
+        /* result needed only for a subset of the vertices */
+        IGRAPH_VECTOR_INIT_FINALLY(tmpres, no_of_edges);
+    } else {
+        /* result covers all vertices */
+        IGRAPH_CHECK(igraph_vector_resize(res, no_of_edges));
+        igraph_vector_null(res);
+        tmpres = res;
+    }
+
+    IGRAPH_CHECK(igraph_vit_create(graph, sources, &vit));
+    IGRAPH_FINALLY(igraph_vit_destroy, &vit);
+
+    for (
+        no_of_processed_sources = 0, IGRAPH_VIT_RESET(vit);
+        !IGRAPH_VIT_END(vit);
+        IGRAPH_VIT_NEXT(vit), no_of_processed_sources++
+    ) {
+        source = IGRAPH_VIT_GET(vit);
+        igraph_real_t population_s = VECTOR(*population_weights)[source];
+        // get the sum of population weights for normalization
+        igraph_real_t population_sum_tmp = population_sum - VECTOR(*population_weights)[source];
+
+        for (igraph_int_t i = 0; i < no_of_nodes; i++) {
+            VECTOR(tmp_population_weights)[i] = VECTOR(*population_weights)[i] / population_sum_tmp * population_s;
+        }
+
+        IGRAPH_PROGRESS(
+            "Edge betweenness centrality (subset): ",
+            100.0 * no_of_processed_sources / no_of_sources, 0
+        );
+        IGRAPH_ALLOW_INTERRUPTION();
+
+        /* Loop invariant that is valid at this point:
+         *
+         * - the stack S is empty
+         * - the 'dist' vector contains zeros only
+         * - the 'nrgeo' array contains zeros only
+         * - the 'tmpscore' array contains zeros only
+         * - the 'parents' incidence list contains empty vectors only
+         */
+
+        /* TODO: there is more room for optimization here; the single-source
+         * shortest path search runs until it reaches all the nodes in the
+         * component of the source node even if we are only interested in a
+         * smaller target subset. We could stop the search when all target
+         * nodes were reached.
+         */
+
+        /* Conduct a single-source shortest path search from the source node */
+        if (weights) {
+            IGRAPH_CHECK(sspf_weighted_edge(graph, source, &dist, nrgeo, weights, &S, &parents, &inclist, upperLimit));
+        } else {
+            IGRAPH_CHECK(sspf_edge(graph, source, &dist, nrgeo, &S, &parents, &inclist, upperLimit));
+        }
+
+        /* Aggregate betweenness scores for the nodes we have reached in this
+         * traversal */
+        while (!igraph_stack_int_empty(&S)) {
+            igraph_int_t actnode = igraph_stack_int_pop(&S);
+            igraph_vector_int_t *parentv = igraph_inclist_get(&parents, actnode);
+            igraph_int_t parentv_len = igraph_vector_int_size(parentv);
+            igraph_real_t coeff;
+            igraph_real_t population_coeff = VECTOR(tmp_population_weights)[actnode];
+
+            if (is_target[actnode]) {
+                coeff = ((1 * population_coeff) + tmpscore[actnode]) / nrgeo[actnode];
+            } else {
+                coeff = tmpscore[actnode] / nrgeo[actnode];
+            }
+
+            for (j = 0; j < parentv_len; j++) {
+                igraph_int_t parent_edge = VECTOR(*parentv)[j];
+                igraph_int_t neighbor = IGRAPH_OTHER(graph, parent_edge, actnode);
+                tmpscore[neighbor] += nrgeo[neighbor] * coeff;
+                VECTOR(*tmpres)[parent_edge] += nrgeo[neighbor] * coeff;
+            }
+
+            /* Reset variables to ensure that the 'for' loop invariant will
+             * still be valid in the next iteration */
+
+            VECTOR(dist)[actnode] = 0;
+            nrgeo[actnode] = 0;
+            tmpscore[actnode] = 0;
+            igraph_vector_int_clear(parentv);
+        }
+    }
+
+    igraph_vit_destroy(&vit);
+    IGRAPH_FINALLY_CLEAN(1);
+
+    /* Keep only the requested edges */
+    if (!igraph_es_is_all(&eids)) {
+        IGRAPH_CHECK(igraph_eit_create(graph, eids, &eit));
+        IGRAPH_FINALLY(igraph_eit_destroy, &eit);
+
+        IGRAPH_CHECK(igraph_vector_resize(res, IGRAPH_EIT_SIZE(eit)));
+
+        for (j = 0, IGRAPH_EIT_RESET(eit); !IGRAPH_EIT_END(eit);
+             IGRAPH_EIT_NEXT(eit), j++) {
+            igraph_int_t edge = IGRAPH_EIT_GET(eit);
+            VECTOR(*res)[j] = VECTOR(*tmpres)[edge];
+        }
+
+        igraph_eit_destroy(&eit);
+        igraph_vector_destroy(tmpres);
+        IGRAPH_FINALLY_CLEAN(2);
+    }
+
+    if (normalized) {
+        normalization_factor = 1.0 / (no_of_nodes * (no_of_nodes - 1.0));
+    } else {
+        normalization_factor = directed ? 1.0 : 0.5;
+    }
+
+    igraph_vector_scale(res, normalization_factor);
+
+    igraph_stack_int_destroy(&S);
+    IGRAPH_FREE(tmpscore);
+    IGRAPH_FREE(nrgeo);
+    igraph_vector_destroy(&dist);
+    igraph_inclist_destroy(&parents);
+    igraph_inclist_destroy(&inclist);
+    IGRAPH_FREE(is_target);
+    IGRAPH_FINALLY_CLEAN(7);
+
+    return IGRAPH_SUCCESS;
+}
