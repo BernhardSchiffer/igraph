@@ -422,6 +422,120 @@ static igraph_error_t sspf_weighted_edge(
     return IGRAPH_SUCCESS;
 }
 
+/**
+ * Internal function to calculate the single source shortest paths for the edge
+ * weighted case.
+ *
+ * \param  graph   the graph to calculate the single source shortest paths on
+ * \param  lengths the lengths of the edges
+ * \param  weights the weights of the edges
+ * \param  source  the source node
+ * \param  dist    distance of each node from the source node \em plus one;
+ *                 must be filled with zeros initially
+ * \param  nrgeo   vector storing the number of geodesics from the source node
+ *                 to each node; must be filled with zeros initially
+ * \param  stack   stack in which the nodes are pushed in the order they are
+ *                 discovered during the traversal
+ * \param  parents incidence list that starts empty and that stores the IDs
+ *                 of the edges that lead to a given node during the traversal
+ * \param  inclist the incidence list of the graph
+ * \param  upperLimit  upperLimit length of shortest paths
+ */
+static igraph_error_t sspf_weighted_edge_limit(
+        const igraph_t *graph,
+        igraph_int_t source,
+        igraph_vector_t *dist,
+        igraph_real_t *nrgeo,
+        const igraph_vector_t *lengths,
+        const igraph_vector_t *weights,
+        igraph_stack_int_t *stack,
+        igraph_inclist_t *parents,
+        const igraph_inclist_t *inclist,
+        igraph_real_t lowerLimit,
+        igraph_real_t upperLimit) {
+
+    const igraph_real_t eps = IGRAPH_SHORTEST_PATH_EPSILON;
+
+    int cmp_result;
+    igraph_2wheap_t queue;
+    const igraph_vector_int_t *neis;
+    igraph_vector_int_t *v;
+    igraph_int_t nlen;
+
+    /* TODO: this is an O|V| step here. We could save some time by pre-allocating
+     * the two-way heap in the caller and re-using it here */
+    IGRAPH_CHECK(igraph_2wheap_init(&queue, igraph_vcount(graph)));
+    IGRAPH_FINALLY(igraph_2wheap_destroy, &queue);
+
+    igraph_2wheap_push_with_index(&queue, source, -1.0); /* reserved */
+    VECTOR(*dist)[source] = 1.0;
+    nrgeo[source] = 1;
+
+    while (!igraph_2wheap_empty(&queue)) {
+        igraph_int_t minnei = igraph_2wheap_max_index(&queue);
+        igraph_real_t mindist = -igraph_2wheap_delete_max(&queue);
+
+        /* Ignore vertices that are more distant than the upperLimit */
+        if (upperLimit >= 0 && mindist > upperLimit + 1.0) {
+            /* Reset variables if node is too distant */
+            VECTOR(*dist)[minnei] = 0;
+            nrgeo[minnei] = 0;
+            igraph_vector_int_clear(igraph_inclist_get(parents, minnei));
+            continue;
+        }
+
+        /* Now check all neighbors of 'minnei' for a shorter path */
+        neis = igraph_inclist_get(inclist, minnei);
+        nlen = igraph_vector_int_size(neis);
+        for (igraph_int_t j = 0; j < nlen; j++) {
+            igraph_int_t edge = VECTOR(*neis)[j];
+            igraph_int_t to = IGRAPH_OTHER(graph, edge, minnei);
+            igraph_real_t altdist = mindist + VECTOR(*weights)[edge];
+            igraph_real_t curdist = VECTOR(*dist)[to];
+
+            if (curdist == 0) {
+                /* this means curdist is infinity */
+                cmp_result = -1;
+            } else {
+                cmp_result = igraph_cmp_epsilon(altdist, curdist, eps);
+            }
+
+            if (curdist == 0) {
+                /* This is the first non-infinite distance */
+                v = igraph_inclist_get(parents, to);
+                IGRAPH_CHECK(igraph_vector_int_resize(v, 1));
+                VECTOR(*v)[0] = edge;
+                nrgeo[to] = nrgeo[minnei];
+                VECTOR(*dist)[to] = altdist;
+                IGRAPH_CHECK(igraph_2wheap_push_with_index(&queue, to, -altdist));
+            } else if (cmp_result < 0) {
+                /* This is a shorter path */
+                v = igraph_inclist_get(parents, to);
+                IGRAPH_CHECK(igraph_vector_int_resize(v, 1));
+                VECTOR(*v)[0] = edge;
+                nrgeo[to] = nrgeo[minnei];
+                VECTOR(*dist)[to] = altdist;
+                igraph_2wheap_modify(&queue, to, -altdist);
+            } else if (cmp_result == 0 && (altdist <= upperLimit + 1.0 || upperLimit < 0)) {
+                /* Only add if the node is not more distant than the upperLimit */
+                v = igraph_inclist_get(parents, to);
+                IGRAPH_CHECK(igraph_vector_int_push_back(v, edge));
+                nrgeo[to] += nrgeo[minnei];
+            }
+        }
+
+        if (mindist >= lowerLimit + 1.0) {
+            /* Record that we have visited this node */
+            IGRAPH_CHECK(igraph_stack_int_push(stack, minnei));
+        }
+    }
+
+    igraph_2wheap_destroy(&queue);
+    IGRAPH_FINALLY_CLEAN(1);
+
+    return IGRAPH_SUCCESS;
+}
+
 static igraph_error_t betweenness_check_weights(
     const igraph_vector_t *weights, igraph_int_t no_of_edges
 ) {
@@ -1559,7 +1673,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
 
         /* Conduct a single-source shortest path search from the source node */
         if (weights) {
-            IGRAPH_CHECK(sspf_weighted_edge(graph, source, &dist, nrgeo, weights, &S, &parents, &inclist, upperLimit));
+            IGRAPH_CHECK(sspf_weighted_edge_limit(graph, source, &dist, nrgeo, distances, weights, &S, &parents, &inclist, lowerLimit, upperLimit));
         } else {
             IGRAPH_CHECK(sspf_edge(graph, source, &dist, nrgeo, &S, &parents, &inclist, upperLimit));
         }
