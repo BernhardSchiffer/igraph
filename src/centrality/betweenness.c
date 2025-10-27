@@ -1702,11 +1702,13 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
 
             /* Reset variables to ensure that the 'for' loop invariant will
              * still be valid in the next iteration */
-
+            igraph_vector_int_clear(parentv);
+        }
+        // reset dist and nrgeo
+        for (igraph_int_t actnode = 0; actnode < no_of_nodes; actnode++) {
             VECTOR(dist)[actnode] = 0;
             nrgeo[actnode] = 0;
             tmpscore[actnode] = 0;
-            igraph_vector_int_clear(parentv);
         }
     }
 
