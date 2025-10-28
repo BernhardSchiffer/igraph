@@ -93,7 +93,7 @@ IGRAPH_EXPORT igraph_error_t igraph_edge_betweenness_subset(
         igraph_bool_t directed, igraph_bool_t normalized);
 
 IGRAPH_EXPORT igraph_error_t igraph_edge_betweenness_subset_limit(
-        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *distances,
+        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *lengths,
         igraph_vector_t *res,
         igraph_vs_t sources, igraph_vs_t targets,
         const igraph_vector_t *population_weights,

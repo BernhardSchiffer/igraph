@@ -441,10 +441,11 @@ static igraph_error_t sspf_weighted_edge(
  * \param  inclist the incidence list of the graph
  * \param  upperLimit  upperLimit length of shortest paths
  */
-static igraph_error_t sspf_weighted_edge_limit(
+static igraph_error_t sspf_weighted_edge_limit_length(
         const igraph_t *graph,
         igraph_int_t source,
         igraph_vector_t *dist,
+        igraph_vector_t *pysical_dist,
         igraph_real_t *nrgeo,
         const igraph_vector_t *lengths,
         const igraph_vector_t *weights,
@@ -458,6 +459,7 @@ static igraph_error_t sspf_weighted_edge_limit(
 
     int cmp_result;
     igraph_2wheap_t queue;
+    igraph_2wheap_t length_queue;
     const igraph_vector_int_t *neis;
     igraph_vector_int_t *v;
     igraph_int_t nlen;
@@ -467,6 +469,12 @@ static igraph_error_t sspf_weighted_edge_limit(
     IGRAPH_CHECK(igraph_2wheap_init(&queue, igraph_vcount(graph)));
     IGRAPH_FINALLY(igraph_2wheap_destroy, &queue);
 
+    /* TODO: this is an O|V| step here. We could save some time by pre-allocating
+     * the two-way heap in the caller and re-using it here */
+    IGRAPH_CHECK(igraph_2wheap_init(&length_queue, igraph_vcount(graph)));
+    IGRAPH_FINALLY(igraph_2wheap_destroy, &length_queue);
+
+    igraph_2wheap_push_with_index(&length_queue, source, 0.0); /* reserved */
     igraph_2wheap_push_with_index(&queue, source, -1.0); /* reserved */
     VECTOR(*dist)[source] = 1.0;
     nrgeo[source] = 1;
@@ -474,9 +482,10 @@ static igraph_error_t sspf_weighted_edge_limit(
     while (!igraph_2wheap_empty(&queue)) {
         igraph_int_t minnei = igraph_2wheap_max_index(&queue);
         igraph_real_t mindist = -igraph_2wheap_delete_max(&queue);
+        igraph_real_t current_length = igraph_2wheap_get(&length_queue, minnei);
 
         /* Ignore vertices that are more distant than the upperLimit */
-        if (upperLimit >= 0 && mindist > upperLimit + 1.0) {
+        if (upperLimit >= 0 && current_length > upperLimit) {
             /* Reset variables if node is too distant */
             VECTOR(*dist)[minnei] = 0;
             nrgeo[minnei] = 0;
@@ -491,6 +500,7 @@ static igraph_error_t sspf_weighted_edge_limit(
             igraph_int_t edge = VECTOR(*neis)[j];
             igraph_int_t to = IGRAPH_OTHER(graph, edge, minnei);
             igraph_real_t altdist = mindist + VECTOR(*weights)[edge];
+            igraph_real_t altlength = current_length + VECTOR(*lengths)[edge];
             igraph_real_t curdist = VECTOR(*dist)[to];
 
             if (curdist == 0) {
@@ -507,7 +517,9 @@ static igraph_error_t sspf_weighted_edge_limit(
                 VECTOR(*v)[0] = edge;
                 nrgeo[to] = nrgeo[minnei];
                 VECTOR(*dist)[to] = altdist;
+                VECTOR(*pysical_dist)[to] = altlength;
                 IGRAPH_CHECK(igraph_2wheap_push_with_index(&queue, to, -altdist));
+                IGRAPH_CHECK(igraph_2wheap_push_with_index(&length_queue, to, altlength));
             } else if (cmp_result < 0) {
                 /* This is a shorter path */
                 v = igraph_inclist_get(parents, to);
@@ -515,8 +527,10 @@ static igraph_error_t sspf_weighted_edge_limit(
                 VECTOR(*v)[0] = edge;
                 nrgeo[to] = nrgeo[minnei];
                 VECTOR(*dist)[to] = altdist;
+                VECTOR(*pysical_dist)[to] = altlength;
                 igraph_2wheap_modify(&queue, to, -altdist);
-            } else if (cmp_result == 0 && (altdist <= upperLimit + 1.0 || upperLimit < 0)) {
+                igraph_2wheap_modify(&length_queue, to, altlength);
+            } else if (cmp_result == 0 && (altlength <= upperLimit || upperLimit < 0)) {
                 /* Only add if the node is not more distant than the upperLimit */
                 v = igraph_inclist_get(parents, to);
                 IGRAPH_CHECK(igraph_vector_int_push_back(v, edge));
@@ -524,14 +538,15 @@ static igraph_error_t sspf_weighted_edge_limit(
             }
         }
 
-        if (mindist >= lowerLimit + 1.0) {
+        if (current_length >= lowerLimit) {
             /* Record that we have visited this node */
             IGRAPH_CHECK(igraph_stack_int_push(stack, minnei));
         }
     }
 
     igraph_2wheap_destroy(&queue);
-    IGRAPH_FINALLY_CLEAN(1);
+    igraph_2wheap_destroy(&length_queue);
+    IGRAPH_FINALLY_CLEAN(2);
 
     return IGRAPH_SUCCESS;
 }
@@ -1555,7 +1570,7 @@ igraph_error_t igraph_edge_betweenness_subset(
  * \ref igraph_edge_betweenness_cutoff() to compute the range-limited edge betweenness.
  */
 igraph_error_t igraph_edge_betweenness_subset_limit(
-        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *distances,
+        const igraph_t *graph, const igraph_vector_t *weights, const igraph_vector_t *lengths,
         igraph_vector_t *res,
         igraph_vs_t sources, igraph_vs_t targets, const igraph_vector_t *population_weights,
         igraph_real_t lowerLimit, igraph_real_t upperLimit,
@@ -1572,6 +1587,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
     igraph_eit_t eit;
     igraph_neimode_t mode = directed ? IGRAPH_OUT : IGRAPH_ALL;
     igraph_vector_t dist;
+    igraph_vector_t physical_dist;
     igraph_vector_t v_tmpres, *tmpres = &v_tmpres;
     igraph_real_t *nrgeo;
     igraph_real_t *tmpscore;
@@ -1610,6 +1626,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
     IGRAPH_FINALLY(igraph_inclist_destroy, &parents);
 
     IGRAPH_VECTOR_INIT_FINALLY(&dist, no_of_nodes);
+    IGRAPH_VECTOR_INIT_FINALLY(&physical_dist, no_of_nodes);
 
     nrgeo = IGRAPH_CALLOC(no_of_nodes, igraph_real_t);
     IGRAPH_CHECK_OOM(nrgeo, "Insufficient memory for subset edge betweenness calculation.");
@@ -1673,7 +1690,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
 
         /* Conduct a single-source shortest path search from the source node */
         if (weights) {
-            IGRAPH_CHECK(sspf_weighted_edge_limit(graph, source, &dist, nrgeo, distances, weights, &S, &parents, &inclist, lowerLimit, upperLimit));
+            IGRAPH_CHECK(sspf_weighted_edge_limit_length(graph, source, &dist, &physical_dist, nrgeo, lengths, weights, &S, &parents, &inclist, lowerLimit, upperLimit));
         } else {
             IGRAPH_CHECK(sspf_edge(graph, source, &dist, nrgeo, &S, &parents, &inclist, upperLimit));
         }
@@ -1707,6 +1724,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
         // reset dist and nrgeo
         for (igraph_int_t actnode = 0; actnode < no_of_nodes; actnode++) {
             VECTOR(dist)[actnode] = 0;
+            VECTOR(physical_dist)[actnode] = 0;
             nrgeo[actnode] = 0;
             tmpscore[actnode] = 0;
         }
@@ -1745,6 +1763,7 @@ igraph_error_t igraph_edge_betweenness_subset_limit(
     IGRAPH_FREE(tmpscore);
     IGRAPH_FREE(nrgeo);
     igraph_vector_destroy(&dist);
+    igraph_vector_destroy(&physical_dist);
     igraph_inclist_destroy(&parents);
     igraph_inclist_destroy(&inclist);
     IGRAPH_FREE(is_target);
